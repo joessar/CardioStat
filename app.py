@@ -16,6 +16,7 @@ import stats_engine
 
 importlib.reload(stats_engine)
 from stats_engine import (
+    CLINICAL_CUTOFFS,
     classify_columns,
     export_results_to_excel,
     load_dataset,
@@ -676,6 +677,238 @@ def render_stage_5_results(mod: str, res: dict[str, Any]) -> None:
     )
 
 
+def render_dashboard(df: pd.DataFrame) -> None:
+    """Render interactive clinical executive dashboard with global filters, KPIs, and Plotly charts."""
+    st.markdown('<span class="stage-badge">Dashboard Ringkasan Klinis</span>', unsafe_allow_html=True)
+
+    filtered = df.copy()
+    with st.container(border=True):
+        st.markdown("**Filter Interaktif Populasi**")
+        f_cols = st.columns(4)
+
+        if "Continent" in filtered.columns:
+            continents = sorted(filtered["Continent"].dropna().astype(str).unique())
+            sel_cont = f_cols[0].multiselect("Benua (Continent)", continents, default=continents)
+            if sel_cont:
+                filtered = filtered[filtered["Continent"].astype(str).isin(sel_cont)]
+
+        if "Sex" in filtered.columns:
+            sexes = sorted(filtered["Sex"].dropna().astype(str).unique())
+            sel_sex = f_cols[1].multiselect("Jenis Kelamin (Sex)", sexes, default=sexes)
+            if sel_sex:
+                filtered = filtered[filtered["Sex"].astype(str).isin(sel_sex)]
+
+        if "Diet" in filtered.columns:
+            diets = sorted(filtered["Diet"].dropna().astype(str).unique())
+            sel_diet = f_cols[2].multiselect("Pola Diet (Diet)", diets, default=diets)
+            if sel_diet:
+                filtered = filtered[filtered["Diet"].astype(str).isin(sel_diet)]
+
+        if "Age" in filtered.columns:
+            age_num = pd.to_numeric(filtered["Age"], errors="coerce").dropna()
+            if not age_num.empty and float(age_num.min()) < float(age_num.max()):
+                min_a, max_a = int(age_num.min()), int(age_num.max())
+                sel_age = f_cols[3].slider("Rentang Usia (Age)", min_a, max_a, (min_a, max_a))
+                filtered = filtered[pd.to_numeric(filtered["Age"], errors="coerce").between(sel_age[0], sel_age[1])]
+
+    if filtered.empty:
+        st.warning("Tidak ada data pasien yang cocok dengan kombinasi filter saat ini.")
+        return
+
+    st.caption(f"Menampilkan **{len(filtered):,}** dari **{len(df):,}** pasien.")
+
+    # Row 1: KPI Cards
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Total Pasien", f"{len(filtered):,}")
+
+    if "Heart Attack Risk" in filtered.columns:
+        risk_series = pd.to_numeric(filtered["Heart Attack Risk"], errors="coerce").dropna()
+        risk_count = int((risk_series == 1).sum())
+        risk_pct = float(risk_series.mean() * 100) if not risk_series.empty else 0.0
+        k2.metric("Berisiko Serangan Jantung", f"{risk_pct:.2f}%", f"{risk_count:,} pasien", delta_color="off")
+    else:
+        k2.metric("Jumlah Variabel", f"{filtered.shape[1]}")
+
+    if "Cholesterol" in filtered.columns:
+        chol_mean = pd.to_numeric(filtered["Cholesterol"], errors="coerce").mean()
+        k3.metric("Rata-rata Kolesterol", f"{chol_mean:.1f} mg/dL")
+    else:
+        k3.metric("Baris Lengkap", f"{int(filtered.dropna().shape[0]):,}")
+
+    if "Systolic_BP" in filtered.columns and "Diastolic_BP" in filtered.columns:
+        sys_m = pd.to_numeric(filtered["Systolic_BP"], errors="coerce").mean()
+        dia_m = pd.to_numeric(filtered["Diastolic_BP"], errors="coerce").mean()
+        k4.metric("Rata-rata Tekanan Darah", f"{sys_m:.0f}/{dia_m:.0f} mmHg")
+    elif "Age" in filtered.columns:
+        k4.metric("Rata-rata Usia", f"{pd.to_numeric(filtered['Age'], errors='coerce').mean():.1f} thn")
+
+    comorb_parts = []
+    for col_name, label in [("Smoking", "Merokok"), ("Diabetes", "Diabetes"), ("Obesity", "Obesitas")]:
+        if col_name in filtered.columns:
+            pct = pd.to_numeric(filtered[col_name], errors="coerce").mean() * 100
+            comorb_parts.append(f"{label} {pct:.0f}%")
+    if comorb_parts:
+        k5.metric("Faktor Risiko Utama", comorb_parts[0], " | ".join(comorb_parts[1:]), delta_color="off")
+    else:
+        k5.metric("Missing Values", f"{int(filtered.isna().sum().sum()):,}")
+
+    st.divider()
+
+    # Row 2: Profil Risiko & Biomarker
+    r1_left, r1_right = st.columns([1, 1.35])
+    with r1_left:
+        if "Heart Attack Risk" in filtered.columns:
+            risk_counts = (
+                filtered["Heart Attack Risk"]
+                .map({0: "Tidak Berisiko (0)", 1: "Berisiko (1)"})
+                .fillna(filtered["Heart Attack Risk"].astype(str))
+                .value_counts()
+                .reset_index()
+            )
+            risk_counts.columns = ["Status Risiko", "Jumlah"]
+            fig_donut = px.pie(
+                risk_counts,
+                names="Status Risiko",
+                values="Jumlah",
+                hole=0.52,
+                color="Status Risiko",
+                color_discrete_map={"Tidak Berisiko (0)": "#2563eb", "Berisiko (1)": "#991b1b"},
+                title="Proporsi Risiko Serangan Jantung",
+            )
+            fig_donut.update_traces(textinfo="percent+value")
+            st.plotly_chart(fig_donut, use_container_width=True)
+
+    with r1_right:
+        cut_rows = []
+        for param in ["Cholesterol", "Systolic_BP", "BMI"]:
+            if param in filtered.columns and param in CLINICAL_CUTOFFS:
+                cfg = CLINICAL_CUTOFFS[param]
+                s = pd.to_numeric(filtered[param], errors="coerce").dropna()
+                cats = pd.cut(s, bins=cfg["bins"], labels=["Rendah / Normal", "Sedang / Borderline", "Tinggi"])
+                vc = cats.value_counts(sort=False)
+                for cat_name, cnt in vc.items():
+                    cut_rows.append(
+                        {
+                            "Parameter": param,
+                            "Kategori Klinis": str(cat_name),
+                            "Persentase (%)": round(float(cnt / len(s) * 100), 2) if len(s) > 0 else 0.0,
+                        }
+                    )
+        if cut_rows:
+            cut_df = pd.DataFrame(cut_rows)
+            fig_cut = px.bar(
+                cut_df,
+                x="Parameter",
+                y="Persentase (%)",
+                color="Kategori Klinis",
+                barmode="stack",
+                text_auto=".1f",
+                color_discrete_map={
+                    "Rendah / Normal": "#16a34a",
+                    "Sedang / Borderline": "#f59e0b",
+                    "Tinggi": "#991b1b",
+                },
+                title="Profil Kategori Risiko Klinis Biomarker (%)",
+            )
+            st.plotly_chart(fig_cut, use_container_width=True)
+
+    # Row 3: Komparasi Kelompok & Wilayah
+    r2_left, r2_right = st.columns(2)
+    with r2_left:
+        if "Heart Attack Risk" in filtered.columns:
+            dim_opts = [c for c in ["Continent", "Diet", "Sex"] if c in filtered.columns]
+            if dim_opts:
+                sel_dim = st.selectbox("Bandingkan Prevalensi Risiko (%) menurut:", dim_opts, key="dash_dim")
+                grp_risk = (
+                    filtered.assign(_risk=pd.to_numeric(filtered["Heart Attack Risk"], errors="coerce"))
+                    .groupby(sel_dim, dropna=True)["_risk"]
+                    .agg(["mean", "count"])
+                    .reset_index()
+                )
+                grp_risk["Prevalensi (%)"] = np.round(grp_risk["mean"] * 100, 2)
+                fig_grp = px.bar(
+                    grp_risk.sort_values("Prevalensi (%)", ascending=False),
+                    x=sel_dim,
+                    y="Prevalensi (%)",
+                    color="Prevalensi (%)",
+                    text="Prevalensi (%)",
+                    color_continuous_scale="Reds",
+                    title=f"Tingkat Risiko Serangan Jantung menurut {sel_dim}",
+                )
+                fig_grp.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+                fig_grp.update_yaxes(range=[0, max(5.0, float(grp_risk["Prevalensi (%)"].max()) * 1.2)])
+                st.plotly_chart(fig_grp, use_container_width=True)
+
+    with r2_right:
+        bio_opts = [c for c in ["Cholesterol", "Systolic_BP", "Diastolic_BP", "BMI", "Triglycerides", "Age"] if c in filtered.columns]
+        if bio_opts and "Heart Attack Risk" in filtered.columns:
+            sel_bio = st.selectbox("Bandingkan Sebaran Biomarker:", bio_opts, key="dash_bio")
+            box_df = filtered[[sel_bio, "Heart Attack Risk"]].dropna().copy()
+            box_df["Status Risiko"] = box_df["Heart Attack Risk"].map({0: "Tidak Berisiko (0)", 1: "Berisiko (1)"}).fillna(
+                box_df["Heart Attack Risk"].astype(str)
+            )
+            fig_bio = px.box(
+                box_df,
+                x="Status Risiko",
+                y=sel_bio,
+                color="Status Risiko",
+                color_discrete_map={"Tidak Berisiko (0)": "#2563eb", "Berisiko (1)": "#991b1b"},
+                title=f"Sebaran {sel_bio} berdasarkan Status Risiko",
+            )
+            st.plotly_chart(fig_bio, use_container_width=True)
+
+    # Row 4: Faktor Gaya Hidup & Heatmap Korelasi
+    r3_left, r3_right = st.columns(2)
+    with r3_left:
+        if "Heart Attack Risk" in filtered.columns:
+            factor_cols = [c for c in ["Smoking", "Diabetes", "Obesity", "Family History", "Alcohol Consumption"] if c in filtered.columns]
+            factor_rows = []
+            for fc in factor_cols:
+                tmp = filtered[[fc, "Heart Attack Risk"]].dropna()
+                for val in sorted(tmp[fc].unique()):
+                    sub = tmp[tmp[fc] == val]
+                    pct = float(pd.to_numeric(sub["Heart Attack Risk"], errors="coerce").mean() * 100)
+                    factor_rows.append(
+                        {
+                            "Faktor Risiko": fc,
+                            "Kondisi": "Ya (1)" if val == 1 else ("Tidak (0)" if val == 0 else str(val)),
+                            "Prevalensi Risiko (%)": round(pct, 2),
+                        }
+                    )
+            if factor_rows:
+                fdf = pd.DataFrame(factor_rows)
+                fig_fac = px.bar(
+                    fdf,
+                    y="Faktor Risiko",
+                    x="Prevalensi Risiko (%)",
+                    color="Kondisi",
+                    barmode="group",
+                    orientation="h",
+                    text_auto=".1f",
+                    color_discrete_map={"Ya (1)": "#991b1b", "Tidak (0)": "#64748b"},
+                    title="Prevalensi Serangan Jantung per Faktor Gaya Hidup & Riwayat",
+                )
+                st.plotly_chart(fig_fac, use_container_width=True)
+
+    with r3_right:
+        heat_cols = [
+            c
+            for c in ["Age", "Cholesterol", "Systolic_BP", "Diastolic_BP", "BMI", "Triglycerides", "Stress Level", "Sleep Hours Per Day"]
+            if c in filtered.columns
+        ]
+        if len(heat_cols) >= 2:
+            corr_mat = filtered[heat_cols].apply(pd.to_numeric, errors="coerce").corr()
+            fig_heat = px.imshow(
+                corr_mat,
+                text_auto=".2f",
+                color_continuous_scale="RdBu_r",
+                zmin=-1,
+                zmax=1,
+                title="Heatmap Korelasi Parameter Klinis & Gaya Hidup",
+            )
+            st.plotly_chart(fig_heat, use_container_width=True)
+
+
 def main() -> None:
     init_session_state()
     render_header()
@@ -686,10 +919,14 @@ def main() -> None:
         st.info("Silakan unggah dataset pasien (.csv/.xlsx) atau klik **Muat Dataset Pasien Jantung** untuk memulai.")
         return
 
-    render_stage_2_preview(df)
-    render_stage_3_navbar()
-    col_meta = classify_columns(df)
-    render_stage_4_and_5(df, col_meta)
+    tab_dash, tab_lab = st.tabs(["Dashboard Ringkasan Klinis", "Laboratorium Uji Statistik"])
+    with tab_dash:
+        render_dashboard(df)
+    with tab_lab:
+        render_stage_2_preview(df)
+        render_stage_3_navbar()
+        col_meta = classify_columns(df)
+        render_stage_4_and_5(df, col_meta)
 
 
 if __name__ == "__main__":
